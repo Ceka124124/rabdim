@@ -1,200 +1,262 @@
-// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
 
-// 🔹 CORS ayarı
-app.use(cors({
-    origin: "*", // Güvenlik için burada kendi frontend domainini yazabilirsin
-    methods: ["GET", "POST"]
-}));
-
 const io = new Server(server, {
     cors: {
-        origin: "*", // Örn: "https://senin-frontend.web.app"
+        origin: "*", 
         methods: ["GET", "POST"]
     }
 });
 
 const PORT = process.env.PORT || 3000;
 
-// Oyun verileri
+app.get('/', (req, res) => {
+    res.send('Dominos sunucusu çalışıyor!');
+});
+
 const rooms = {};
 
+function createInitialRoomState() {
+    return {
+        players: {},
+        playerCount: 0,
+        dominoes: createDominoes(),
+        gameStarted: false,
+        hostId: null,
+        turn: null,
+        gameBoard: []
+    };
+}
+
+function createDominoes() {
+    const newDominoes = [];
+    for (let i = 0; i <= 6; i++) {
+        for (let j = i; j <= 6; j++) {
+            newDominoes.push([i, j]);
+        }
+    }
+    return newDominoes;
+}
+
+function shuffleDominoes(dominoes) {
+    for (let i = dominoes.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [dominoes[i], dominoes[j]] = [dominoes[j], dominoes[i]];
+    }
+}
+
+// Bir sonraki oyuncuyu belirleme
+function getNextPlayerTurn(currentTurn, playerIds) {
+    const currentIndex = playerIds.indexOf(currentTurn);
+    const nextIndex = (currentIndex + 1) % playerIds.length;
+    return playerIds[nextIndex];
+}
+
+// Domino taşı geçerliliğini kontrol etme
+function isValidMove(domino, gameBoard) {
+    if (gameBoard.length === 0) {
+        // İlk taş her zaman geçerlidir
+        return true;
+    }
+    const leftEnd = gameBoard[0][0];
+    const rightEnd = gameBoard[gameBoard.length - 1][1];
+    
+    // Taşın iki ucundaki sayılardan biri, oyun tahtasının uçlarıyla eşleşmeli
+    return (domino[0] === leftEnd || domino[0] === rightEnd || domino[1] === leftEnd || domino[1] === rightEnd);
+}
+
 io.on('connection', (socket) => {
-    console.log(`Yeni bir kullanıcı bağlandı: ${socket.id}`);
+    console.log(`Yeni bir oyuncu bağlandı: ${socket.id}`);
 
-    // Odaya katılma
-    socket.on('joinRoom', (data) => {
-        const { roomName, playerName } = data;
-        let room = rooms[roomName];
+    socket.on('join-room', (data) => {
+        const { username, roomId } = data;
 
+        if (!username || !roomId) {
+            socket.emit('error', 'Kullanıcı adı ve oda ID\'si gerekli.');
+            return;
+        }
+
+        if (rooms[roomId] && rooms[roomId].gameStarted) {
+            socket.emit('error', 'Oyun bu odada zaten başladı, katılamazsınız.');
+            return;
+        }
+
+        if (!rooms[roomId]) {
+            rooms[roomId] = createInitialRoomState();
+            rooms[roomId].hostId = socket.id;
+            socket.emit('is-host', true);
+            console.log(`Oda ${roomId} oluşturuldu. Host: ${username}`);
+        } else {
+            socket.emit('is-host', false);
+        }
+
+        const room = rooms[roomId];
+        if (room.playerCount >= 4) {
+            socket.emit('error', 'Oda dolu.');
+            return;
+        }
+
+        socket.join(roomId);
+        room.players[socket.id] = { id: socket.id, username, hand: [], score: 0 };
+        room.playerCount++;
+
+        io.to(roomId).emit('player-update', Object.values(room.players).map(p => ({
+            username: p.username,
+            id: p.id,
+            handSize: p.hand.length 
+        })));
+
+        socket.emit('room-joined', { username, roomId });
+        console.log(`${username} oyuncusu ${roomId} odasına katıldı.`);
+    });
+
+    socket.on('shuffle-and-deal', (roomId) => {
+        const room = rooms[roomId];
         if (!room) {
-            room = {
-                players: {},
-                spectators: {},
-                state: 'waiting',
-                currentPlayerIndex: 0,
-                questions: [],
-                playerAnswers: {},
-                playerGuesses: {}
-            };
-            rooms[roomName] = room;
+            socket.emit('error', 'Oda bulunamadı.');
+            return;
         }
-
-        // Oyuncu kapasitesi dolmuşsa izleyici ekle
-        if (Object.keys(room.players).length >= 2) {
-            room.spectators[socket.id] = { name: playerName };
-            socket.join(roomName);
-            socket.emit('spectatorMode', 'İzleyici olarak bağlandınız.');
-            io.to(socket.id).emit('updatePlayers', room.players);
-            io.to(socket.id).emit('stateChange', { state: room.state });
-            console.log(`${playerName} ${roomName} odasına izleyici olarak katıldı.`);
+        if (room.hostId !== socket.id || room.gameStarted) {
+            socket.emit('error', 'Bu işlemi yapmaya yetkiniz yok.');
             return;
         }
 
-        // Oyuncu ekle
-        room.players[socket.id] = { name: playerName, score: 0 };
-        socket.join(roomName);
-
-        if (Object.keys(room.players).length === 2) {
-            room.state = 'answering_p1';
-            const playerIds = Object.keys(room.players);
-            io.to(playerIds[0]).emit('yourTurnToAnswer', 'Sıra sizde, soruları cevaplayın.');
-            io.to(playerIds[1]).emit('waitingForPartner', `${room.players[playerIds[0]].name} cevap veriyor.`);
-            io.to(roomName).emit('stateChange', { state: room.state });
-        }
-
-        io.to(roomName).emit('updatePlayers', room.players);
-        console.log(`${playerName} oyuncusu ${roomName} odasına katıldı.`);
-    });
-
-    // Cevap gönderme
-    socket.on('submitAnswer', (data) => {
-        const { roomName, answer } = data;
-        const room = rooms[roomName];
-        if (!room || (room.state !== 'answering_p1' && room.state !== 'answering_p2')) return;
-
-        if (room.spectators[socket.id]) {
-            socket.emit('notAllowed', 'İzleyiciler oynayamaz.');
-            return;
-        }
+        room.gameStarted = true;
+        shuffleDominoes(room.dominoes);
 
         const playerIds = Object.keys(room.players);
-        const answeringPlayerId = room.state === 'answering_p1' ? playerIds[0] : playerIds[1];
-
-        if (socket.id !== answeringPlayerId) {
-            socket.emit('notYourTurn', 'Sıra sizde değil.');
-            return;
-        }
-
-        room.playerAnswers[socket.id] = answer;
-
-        if (room.state === 'answering_p1') {
-            room.state = 'guessing_p2';
-            io.to(playerIds[1]).emit('yourTurnToGuess', `Eşiniz ${room.players[playerIds[0]].name} cevap verdi, tahmin edin!`);
-            io.to(playerIds[0]).emit('waitingForPartner', `Eşiniz ${room.players[playerIds[1]].name} tahmin ediyor.`);
-        }
-    });
-
-    // Tahmin gönderme
-    socket.on('submitGuess', (data) => {
-        const { roomName, guess } = data;
-        const room = rooms[roomName];
-        if (!room || (room.state !== 'guessing_p1' && room.state !== 'guessing_p2')) return;
-
-        if (room.spectators[socket.id]) {
-            socket.emit('notAllowed', 'İzleyiciler oynayamaz.');
-            return;
-        }
-
-        const playerIds = Object.keys(room.players);
-        const guessingPlayerId = room.state === 'guessing_p1' ? playerIds[0] : playerIds[1];
-
-        if (socket.id !== guessingPlayerId) {
-            socket.emit('notYourTurn', 'Sıra sizde değil.');
-            return;
-        }
-
-        const partnerId = playerIds.find(id => id !== guessingPlayerId);
-        const correctAnswer = room.playerAnswers[partnerId];
-
-        if (guess === correctAnswer) {
-            room.players[guessingPlayerId].score += 10;
-            io.to(roomName).emit('scoreUpdate', {
-                player: room.players[guessingPlayerId].name,
-                score: room.players[guessingPlayerId].score
-            });
-        }
-
-        if (room.state === 'guessing_p2') {
-            room.playerAnswers = {};
-            room.playerGuesses = {};
-            room.state = 'answering_p2';
-            io.to(playerIds[1]).emit('yourTurnToAnswer', 'Sıra sizde, soruları cevaplayın.');
-            io.to(playerIds[0]).emit('waitingForPartner', `${room.players[playerIds[1]].name} cevap veriyor.`);
-        } else if (room.state === 'guessing_p1') {
-            room.state = 'finished';
-            const sortedPlayers = Object.values(room.players).sort((a, b) => b.score - a.score);
-            const winner = sortedPlayers[0];
-            io.to(roomName).emit('endGame', {
-                message: `Oyun bitti! En iyi eş: ${winner.name}!`
-            });
-        }
-        io.to(roomName).emit('stateChange', { state: room.state });
-    });
-
-    // 🔹 Canlı Yazılı Sohbet
-    socket.on('chatMessage', (data) => {
-        const { roomName, playerName, message } = data;
-        if (!rooms[roomName]) return;
-
-        io.to(roomName).emit('chatMessage', {
-            player: playerName,
-            message,
-            time: new Date().toLocaleTimeString()
+        playerIds.forEach(playerId => {
+            room.players[playerId].hand = room.dominoes.splice(0, 7);
+            io.to(playerId).emit('your-hand', room.players[playerId].hand);
         });
+
+        room.turn = playerIds[Math.floor(Math.random() * playerIds.length)];
+        io.to(roomId).emit('game-state', {
+            status: 'başladı',
+            message: 'Oyun başladı, taşlar dağıtıldı!',
+            turn: room.turn
+        });
+
+        io.to(roomId).emit('player-update', Object.values(room.players).map(p => ({
+            username: p.username,
+            id: p.id,
+            handSize: p.hand.length
+        })));
+    });
+    
+    socket.on('place-domino', (data) => {
+        const { roomId, domino } = data;
+        const room = rooms[roomId];
+
+        if (!room || room.turn !== socket.id || !room.gameStarted) {
+            socket.emit('error', 'Sıra sizde değil veya oyun başlamadı.');
+            return;
+        }
+
+        const playerHand = room.players[socket.id].hand;
+        const dominoIndex = playerHand.findIndex(d => d[0] === domino[0] && d[1] === domino[1]);
+
+        if (dominoIndex === -1) {
+            socket.emit('error', 'Bu taş elinizde bulunmuyor.');
+            return;
+        }
+
+        if (!isValidMove(domino, room.gameBoard)) {
+            socket.emit('error', 'Bu taş uygun değil.');
+            return;
+        }
+        
+        // Taşı elden çıkar ve tahtaya ekle
+        playerHand.splice(dominoIndex, 1);
+        room.gameBoard.push(domino);
+
+        // Kazanma kontrolü
+        if (playerHand.length === 0) {
+            io.to(roomId).emit('game-over', { winner: room.players[socket.id].username });
+            delete rooms[roomId]; // Oyunu bitir ve odayı sil
+            return;
+        }
+
+        // Sıradaki oyuncuyu belirle
+        const playerIds = Object.keys(room.players);
+        room.turn = getNextPlayerTurn(socket.id, playerIds);
+        
+        io.to(roomId).emit('turn-update', room.turn);
+        io.to(roomId).emit('board-update', room.gameBoard);
+        io.to(roomId).emit('player-update', Object.values(room.players).map(p => ({
+            username: p.username,
+            id: p.id,
+            handSize: p.hand.length
+        })));
     });
 
-    // 🔹 Sesli Sohbet (WebRTC sinyalleme)
-    socket.on('voiceOffer', (data) => {
-        io.to(data.to).emit('voiceOffer', { from: socket.id, sdp: data.sdp });
+    socket.on('draw-domino', (roomId) => {
+        const room = rooms[roomId];
+        if (!room || room.turn !== socket.id || !room.gameStarted) {
+            socket.emit('error', 'Sıra sizde değil veya oyun başlamadı.');
+            return;
+        }
+
+        if (room.dominoes.length > 0) {
+            const drawnDomino = room.dominoes.pop();
+            room.players[socket.id].hand.push(drawnDomino);
+            socket.emit('domino-drawn', drawnDomino);
+            
+            // Sıra hala aynı oyuncuda kalabilir, çünkü taş çekmek pas geçmek sayılır
+            // Ancak, taş çekince sıra otomatik olarak diğer oyuncuya geçecekse aşağıdaki satırları kullanabilirsiniz.
+            // const playerIds = Object.keys(room.players);
+            // room.turn = getNextPlayerTurn(socket.id, playerIds);
+            // io.to(roomId).emit('turn-update', room.turn);
+            
+            io.to(roomId).emit('player-update', Object.values(room.players).map(p => ({
+                username: p.username,
+                id: p.id,
+                handSize: p.hand.length
+            })));
+
+        } else {
+            socket.emit('error', 'Çekilecek taş kalmadı.');
+        }
     });
 
-    socket.on('voiceAnswer', (data) => {
-        io.to(data.to).emit('voiceAnswer', { from: socket.id, sdp: data.sdp });
-    });
-
-    socket.on('iceCandidate', (data) => {
-        io.to(data.to).emit('iceCandidate', { from: socket.id, candidate: data.candidate });
-    });
-
-    // Bağlantı kopunca
     socket.on('disconnect', () => {
-        console.log(`Kullanıcı bağlantısı kesildi: ${socket.id}`);
-        for (const roomName in rooms) {
-            const room = rooms[roomName];
+        for (const roomId in rooms) {
+            const room = rooms[roomId];
             if (room.players[socket.id]) {
+                const username = room.players[socket.id].username;
                 delete room.players[socket.id];
-                if (Object.keys(room.players).length === 0 && Object.keys(room.spectators).length === 0) {
-                    delete rooms[roomName];
-                } else {
-                    io.to(roomName).emit('updatePlayers', room.players);
+                room.playerCount--;
+
+                if (room.hostId === socket.id) {
+                    const remainingPlayers = Object.keys(room.players);
+                    if (remainingPlayers.length > 0) {
+                        room.hostId = remainingPlayers[0];
+                        io.to(room.hostId).emit('is-host', true);
+                    } else {
+                        delete rooms[roomId];
+                        console.log(`Oda ${roomId} silindi.`);
+                        return;
+                    }
                 }
-                break;
-            }
-            if (room.spectators[socket.id]) {
-                delete room.spectators[socket.id];
+
+                io.to(roomId).emit('player-update', Object.values(room.players).map(p => ({
+                    username: p.username,
+                    id: p.id,
+                    handSize: p.hand.length
+                })));
+                console.log(`${username} oyuncusu ${roomId} odasından ayrıldı.`);
                 break;
             }
         }
+        console.log(`Bir oyuncu ayrıldı: ${socket.id}`);
     });
 });
 
 server.listen(PORT, () => {
-    console.log(`Sunucu ${PORT} portunda çalışıyor.`);
+    console.log(`Sunucu http://localhost:${PORT} adresinde çalışıyor`);
 });
+    
